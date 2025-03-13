@@ -1,0 +1,2192 @@
+---
+title: "Tracing connections Analysis for paper"
+author: "Juan-Marco Puerta Schardt"
+date: "2025-03-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## loading packages and premade functions
+
+```{r 1}
+library(here) #loading data faster
+library(tidyverse) #cleaning&transforming data
+library(factoextra) #multivariate statistic
+library(FactoMineR) #multivariate statistic
+library(MASS) #discriminatory analysis
+library(caret) #discriminatory analysis
+
+#own functions
+source(here("R/RFA-Functions.R"))
+```
+
+## loading registry and data
+
+```{r 2}
+Messprotokoll <- read.csv2(here("data/Messprotokoll_JAS.csv")) 
+```
+
+
+
+```{r 3}
+folder_path <- here("data/Messungsdaten")
+
+measurements <- load_xrf(folder_path)
+
+```
+
+
+```{r 4}
+measurements <- measurements |> 
+    mutate(Reading.No = as.numeric(Reading.No)) 
+
+
+RFA <- Messprotokoll |> 
+  left_join(measurements, by = c("Nr" = "Reading.No"))|> 
+  filter(!is.na(User.Login)) |> 
+  dplyr::select_if(~ !all(is.na(.)))
+
+Messprotokoll |> 
+  left_join(measurements, by = c("Nr" = "Reading.No")) |>   
+  filter(is.na(User.Login))
+  
+Messprotokoll <- Messprotokoll |> 
+  filter(Nr %in% RFA$Nr)
+
+```
+## get values and errors
+
+```{r }
+# Process the RFA data to extract values, replacing "<LOD" with 0 and converting to numeric
+RFA.val <- RFA |> 
+  dplyr::select(Nr, Mo:Mg) |>  # Select columns from 'Nr' to 'Mg'
+  dplyr::select(-contains(".Error")) |>  # Exclude columns containing ".Error"
+  column_to_rownames("Nr") |>  # Set 'Nr' as row names
+  mutate(across(everything(), ~ ifelse(grepl("<LOD", .), 0, as.character(.)))) |>  # Replace "<LOD" with 0
+  mutate_all(funs(str_replace_all(., ",", "\\."))) |>  # Replace commas with periods
+  mutate_all(as.numeric)  # Convert all columns to numeric
+
+# Process the RFA data to extract error values
+RFA.error <- RFA |> 
+  dplyr::select(Nr, contains(".Error")) |>  # Select columns containing ".Error"
+  column_to_rownames("Nr") |>   # Set 'Nr' as row names
+    mutate_all(as.numeric)
+```
+
+```{r}
+LOD_proportions <- RFA |> 
+  # dplyr::select(where(~ any(grepl("<LOD", .))))  |> # Keep only columns containing "<LOD"
+   summarise(across(everything(), ~ sum(grepl("<LOD", .)) / n())) |>  # Calculate proportion of "<LOD" per column
+  pivot_longer(everything(), names_to = "Element", values_to = "Proportion_LOD") |>  # Convert to long format
+  filter(Proportion_LOD > 0) |>  # Keep only columns with at least one "<LOD"
+  arrange(desc(Proportion_LOD))  # Sort by proportion in descending order
+
+bad.lod.elements <- LOD_proportions |> 
+  filter(Proportion_LOD > 0.25) |> 
+  pull(Element)
+
+# Plot the data using ggplot2
+ggplot(LOD_proportions, aes(x = reorder(Element, -Proportion_LOD), y = Proportion_LOD)) +
+  geom_bar(stat = "identity", fill = "steelblue") +  # Bar plot
+  labs(
+    x = "Element",  # x-axis label
+    y = "Anteil der <LOD-Werte",  # y-axis label
+    title = "Anteil der <LOD-Werte pro Element"  # Plot title
+  ) +
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for better readability
+```
+
+##error
+
+```{r}
+
+RFA.error_prop <- RFA.error/RFA.val*100 
+
+# Replace infinite values (Inf) with NA (e.g., where RFA.val was 0)
+RFA.error_prop[RFA.error_prop == Inf] <- NA
+
+# Summarize the relative error statistics (mean, sd, median) for each element
+error_summary <- RFA.error_prop %>%
+  summarise(across(everything(), list(
+    mean = ~ mean(.x, na.rm = TRUE),  # Calculate mean
+    sd = ~ sd(.x, na.rm = TRUE),      # Calculate standard deviation
+    median = ~ median(.x, na.rm = TRUE)  # Calculate median
+  ))) %>%
+  pivot_longer(
+    cols = everything(),  # Convert all columns to long format
+    names_to = c("Element", "variable"),  # Split column names into "Element" and "variable"
+    names_pattern = "(.*)_(.*)"  # Use regex to separate element names from statistics
+  )
+
+# Filter and print elements with mean relative error < 20%, sorted by value
+error_summary |> 
+  filter(variable == "mean") |>  # Filter for mean values
+  arrange(value) |>  # Sort by mean value
+  rename(mean = value) |> #Renaming value to mean
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name (remove suffixes)
+  print()
+
+# Filter and print elements with standard deviation of relative error, sorted by value
+error_summary |> 
+  filter(variable == "sd") |>  # Filter for standard deviation values
+  arrange(value) |>  # Sort by standard deviation
+    rename(sd = value) |> #Renaming value to sd
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name
+  print()
+
+# Filter and print elements with median relative error, sorted by value
+error_summary |> 
+  filter(variable == "median") |>  # Filter for median values
+  arrange(value) |>  # Sort by median
+      rename(sd = value) |> #Renaming value to median
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name
+  print()
+
+# Extract elements with mean relative error < 10% (excluding "Bal")
+low.error.elements_10 <- error_summary |> 
+  filter(variable == "mean" & value < 10) |>  # Filter for mean values below 10%
+  arrange(value) |>  # Sort by mean value
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name
+  filter(Element != "Bal") |>  # Exclude "Bal" (if present)
+  pull(Element)  # Extract element names as a vector
+
+# Extract elements with mean relative error < 15% (excluding "Bal")
+low.error.elements_15 <- error_summary |> 
+  filter(variable == "mean" & value < 15) |>  # Filter for mean values below 20%
+  arrange(value) |>  # Sort by mean value
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name
+  filter(Element != "Bal") |>  # Exclude "Bal" (if present)
+  pull(Element)  # Extract element names as a vector
+
+# Extract elements with mean relative error < 20% (excluding "Bal")
+low.error.elements_20 <- error_summary |> 
+  filter(variable == "mean" & value < 20) |>  # Filter for mean values below 20%
+  arrange(value) |>  # Sort by mean value
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |>  # Extract element name
+  filter(Element != "Bal") |>  # Exclude "Bal" (if present)
+  pull(Element)  # Extract element names as a vector
+
+all_elements <- RFA.val |> 
+  dplyr::select(-Bal) |> 
+  colnames()
+
+# Print the results
+print(low.error.elements_10)
+print(low.error.elements_20)
+```
+
+```{r}
+# Ensure RFA.error_prop is in a tidy format (long format) for ggplot
+RFA.error_prop_long <- RFA.error_prop %>%
+  pivot_longer(cols = everything(), names_to = "Element", values_to = "Error_Proportion") %>%
+  filter(!is.na(Error_Proportion))  # Remove NA values
+
+# Create the boxplot
+ggplot(RFA.error_prop_long, aes(x = Element, y = Error_Proportion)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +  # Boxplot with custom fill color
+  labs(
+    x = "Element",  # x-axis label
+    y = "Relative Error (%)",  # y-axis label
+    title = "Distribution of Relative Errors by Element"  # Plot title
+  ) +
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for better readability
+```
+
+
+# LOD taken into account
+```{r}
+# Process the RFA data to extract values, replacing "<LOD" with the midpoint between the column mean and 0
+RFA.val <- RFA |> 
+  dplyr::select(Nr, Mo:Mg) |>  # Select columns from 'Nr' to 'Mg'
+  dplyr::select(-contains(".Error")) |>  # Exclude columns containing ".Error"
+  column_to_rownames("Nr") |>  # Set 'Nr' as row names
+  mutate(across(everything(), ~ ifelse(grepl("<LOD", .), NA, as.character(.)))) |>  # Replace "<LOD" with NA
+  mutate_all(funs(str_replace_all(., ",", "\\."))) |>  # Replace commas with periods
+  mutate_all(as.numeric) |>  # Convert all columns to numeric
+  mutate(across(everything(), ~ ifelse(is.na(.), min(., na.rm = TRUE) / 2, .))) |>  # Replace NA with midpoint between column mean and 0
+ dplyr::select(where(~!any(is.infinite(.)))) #remove columns containing only na
+
+
+```
+
+## calibration
+```{r}
+# Load calibration data
+calib_mean <- read.csv2(here("data/Calibration data/calib_mean.csv")) |> 
+  dplyr::select(-Position)  # Remove the "Position" column
+
+calib_aim <- read.csv2(here("data/Calibration data/calib_aim.csv")) |> 
+  dplyr::select(-Probe)  # Remove the "Probe" column
+
+# Keep only common columns between calib_mean and calib_aim
+calib_mean <- calib_mean |>  
+  dplyr::select(all_of(intersect(names(calib_aim), names(calib_mean)))) 
+
+calib_aim <- calib_aim |>  
+  dplyr::select(all_of(intersect(names(calib_aim), names(calib_mean))))
+```
+
+```{r}
+# Initialize an empty list to store the linear regression models
+models <- list()
+
+# Perform linear regression for each column in calib_aim
+for (col in names(calib_aim)) {
+  # Combine calibration and target data into a dataframe
+  data <- data.frame(y = calib_mean[[col]], x = calib_aim[[col]])
+  
+  # Create a linear model: y ~ x (y is the dependent variable, x is the independent variable)
+  model <- lm(y ~ x, data = data)
+  
+  # Store the model in the list with the column name as the key
+  models[[col]] <- model
+  
+  # Calculate the correlation and p-value between y and x
+  correlation <- cor.test(data$y, data$x)
+  
+  # Print the correlation coefficient and p-value for the current column
+  cat("Correlation and p-value for column", col, ":", correlation$estimate, "&", correlation$p.value, "\n")
+}
+
+# Display the list of models
+print(models)
+
+# Function to calibrate new data using the linear models
+calibrate_data <- function(new_data, models) {
+  # Create a copy of the new data to store the calibrated values
+  calibrated_data <- new_data
+  
+  # Loop through each column in the new data
+  for (col in names(new_data)) {
+    # Check if a model exists for the current column
+    if (col %in% names(models)) {
+      # Extract the model for the current column
+      model <- models[[col]]
+      
+      # Get the intercept and slope from the model coefficients
+      intercept <- coef(model)[1]
+      slope <- coef(model)[2]
+      
+      # Apply the calibration equation: y = slope * x + intercept
+      calibrated_data[[col]] <- slope * new_data[[col]] + intercept
+    }
+  }
+  
+  # Return the calibrated data
+  return(calibrated_data)
+}
+
+# Apply the calibration models to the new dataframe (calib_mean)
+calibrated_data <- calibrate_data(calib_mean, models)
+
+# Display the calibrated dataframe
+print(calibrated_data)
+
+# Apply the calibration models to RFA.val
+RFA.val_cal <- calibrate_data(RFA.val, models)
+```
+
+
+## removing outliers
+
+
+```{r}
+remove_outliers_and_calculate_stat <- function(values, threshold = 1.5, method = "iqr", calc_sd = FALSE) {
+  # Remove NA values from the input
+  values <- na.omit(values)
+  n <- length(values)
+
+  # Wenn weniger als 3 Werte vorhanden sind, direkt Mittelwert oder SD berechnen
+  if (n < 3 || length(unique(values)) == 1) {  # NEU: Wenn alle Werte gleich sind
+    if (calc_sd) {
+      return(0)  # Wenn alle Werte gleich sind, ist die SD immer 0
+    } else {
+      return(mean(values, na.rm = TRUE))
+    }
+  }
+
+  # Check if the method is valid
+  if (!method %in% c("z", "iqr", "modified_z", "dixon")) {
+    stop("Invalid method. Use 'z' for Z-score, 'iqr' for Interquartile Range, 'modified_z' for Modified Z-Score, or 'dixon' for Dixon's Q-Test.")
+  }
+
+  # Z-score method
+  if (method == "z") {
+    mean_value <- mean(values, na.rm = TRUE)
+    sd_value <- sd(values, na.rm = TRUE)
+    
+    # Sicherstellen, dass sd_value nicht 0 ist, um Division durch 0 zu vermeiden
+    if (sd_value == 0) {
+      non_outliers <- values
+    } else {
+      z_scores <- (values - mean_value) / sd_value
+      non_outliers <- values[abs(z_scores) <= threshold]
+    }
+
+  } else if (method == "iqr") {  
+    Q1 <- quantile(values, 0.25, na.rm = TRUE)
+    Q3 <- quantile(values, 0.75, na.rm = TRUE)
+    IQR_value <- Q3 - Q1
+    lower_bound <- Q1 - threshold * IQR_value
+    upper_bound <- Q3 + threshold * IQR_value
+    non_outliers <- values[values >= lower_bound & values <= upper_bound]
+
+  } else if (method == "modified_z") {  
+    median_value <- median(values, na.rm = TRUE)
+    mad_value <- mad(values, na.rm = TRUE)
+    
+    # Sicherstellen, dass mad_value nicht 0 ist, um Division durch 0 zu vermeiden
+    if (mad_value == 0) {
+      non_outliers <- values
+    } else {
+      modified_z_scores <- 0.6745 * (values - median_value) / mad_value
+      non_outliers <- values[abs(modified_z_scores) <= threshold]
+    }
+
+  } else if (method == "dixon") {  
+    sorted_values <- sort(values)
+
+    # Falls alle Werte gleich sind, macht Dixon’s Test keinen Sinn
+    if (sorted_values[n] == sorted_values[1]) {
+      non_outliers <- sorted_values
+    } else {
+      Q_min <- (sorted_values[2] - sorted_values[1]) / (sorted_values[n] - sorted_values[1])
+      Q_max <- (sorted_values[n] - sorted_values[n - 1]) / (sorted_values[n] - sorted_values[1])
+      
+      critical_Q <- 0.941  # 95% Konfidenzniveau
+
+      # Überprüfe auf NA-Werte in Q-Werten, falls Division durch 0 vorliegt
+      if (is.na(Q_min) | is.na(Q_max)) {
+        non_outliers <- sorted_values
+      } else {
+        # Entferne beide Ausreißer, wenn beide über dem kritischen Wert liegen
+        if (Q_min > critical_Q & Q_max > critical_Q) {
+          non_outliers <- sorted_values[2:(n - 1)]
+        } else if (Q_min > critical_Q) {
+          non_outliers <- sorted_values[-1]  # Entferne nur das kleinste Element
+        } else if (Q_max > critical_Q) {
+          non_outliers <- sorted_values[-n]  # Entferne nur das größte Element
+        } else {
+          non_outliers <- sorted_values  # Keine Outlier
+        }
+      }
+    }
+  }
+
+  # Berechne Mean oder SD in %
+  if (calc_sd) {
+    mean_non_outliers <- mean(non_outliers, na.rm = TRUE)
+    sd_non_outliers <- sd(non_outliers, na.rm = TRUE)
+
+    # Sicherstellen, dass keine Division durch 0 passiert
+    if (mean_non_outliers == 0) {
+      return(0)
+    } else {
+      return(sd_non_outliers / mean_non_outliers * 100)
+    }
+  } else {
+    return(mean(non_outliers, na.rm = TRUE))
+  }
+}
+
+```
+
+
+```{r}
+RFA.val_mean <- cbind(Messprotokoll, RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(across(where(is.numeric), remove_outliers_and_calculate_stat),
+            across(where(is.character), first)) 
+
+RFA.val_dix <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "dixon")),
+    across(where(is.character), first)
+  )
+
+RFA.val_mz <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "modified_z")),
+    across(where(is.character), first)
+  )
+
+RFA.val_z <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "z", threshold = 0.5)),
+    across(where(is.character), first)
+  )
+
+
+# Berechnung des Mittelwerts für numerische Spalten und Beibehalten des ersten Werts für nicht-numerische Spalten
+RFA3 <- cbind(Messprotokoll, RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+    dplyr::select(-Nr) |> 
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+            across(where(is.character), first))
+
+
+
+RFA.sd_cl <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "iqr", calc_sd = TRUE)),
+    across(where(is.character), first)
+  )
+
+RFA.sd_cl <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "modified_z", calc_sd = TRUE)),
+    across(where(is.character), first)
+  )
+
+RFA.sd_cl <- Messprotokoll |> 
+  cbind(RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  dplyr::select(-Nr) |> 
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "dixon", calc_sd = TRUE)),
+    across(where(is.character), first)
+  )
+
+
+#RFA.val_mean |> 
+ # dplyr::select(colnames(RFA3)) |> 
+#compare_dataframes(RFA3)
+
+#RFA.val_mean |> 
+#  dplyr::select(colnames(RFA3)) |> 
+#compare_dataframes(RFA.val_dix)
+
+#RFA3 |> 
+#  dplyr::select(colnames(RFA3)) |> 
+#compare_dataframes(RFA.val_mz)
+#
+#RFA3 |> 
+#  dplyr::select(colnames(RFA3)) |> 
+#compare_dataframes(RFA.val_z)
+
+```
+
+
+###comparing outlier by method
+```{r}
+detect_outliers <- function(values, method = "iqr") {
+  values <- na.omit(values)
+  n <- length(values)
+
+  if (n < 3) {
+    return(data.frame(value = values, outlier = FALSE))  # Keine Outlier-Detektion möglich
+  }
+
+  is_outlier <- rep(FALSE, n)  # Standardmäßig keine Outlier
+
+  if (method == "z") {
+    mean_value <- mean(values, na.rm = TRUE)
+    sd_value <- sd(values, na.rm = TRUE)
+    z_scores <- (values - mean_value) / sd_value
+    is_outlier <- abs(z_scores) > 1.5
+
+  } else if (method == "iqr") {
+    Q1 <- quantile(values, 0.25, na.rm = TRUE)
+    Q3 <- quantile(values, 0.75, na.rm = TRUE)
+    IQR_value <- Q3 - Q1
+    lower_bound <- Q1 - 0.5 * IQR_value
+    upper_bound <- Q3 + 0.5 * IQR_value
+    is_outlier <- (values < lower_bound) | (values > upper_bound)
+
+  } else if (method == "modified_z") {
+    median_value <- median(values, na.rm = TRUE)
+    mad_value <- mad(values, na.rm = TRUE)
+    modified_z_scores <- 0.6745 * (values - median_value) / mad_value
+    is_outlier <- abs(modified_z_scores) > 1.5 # Threshold für modified Z-Score
+
+  } else if (method == "dixon") {
+    sorted_values <- sort(values)
+    if (sorted_values[n] == sorted_values[1]) {
+      return(data.frame(value = values, outlier = FALSE))  # Keine Outlier
+    } 
+
+    Q_min <- (sorted_values[2] - sorted_values[1]) / (sorted_values[n] - sorted_values[1])
+    Q_max <- (sorted_values[n] - sorted_values[n - 1]) / (sorted_values[n] - sorted_values[1])
+    critical_Q <- 0.941
+
+    is_outlier[values == sorted_values[1]] <- Q_min > critical_Q
+    is_outlier[values == sorted_values[n]] <- Q_max > critical_Q
+  }
+
+  return(data.frame(value = values, outlier = is_outlier))
+}
+
+```
+
+
+```{r}
+
+example_objects <- c("MAR1_15", "MAR1_16", "MAR1_26", "MAR1_3", "MAR1_34", 
+            "MAR1_39", "MAR1_42", "MAR1_45", "MAR1_5", "MAR2_0", "MAR2_1", "MAR2_17", 
+            "MAR2_214", "MAR2_25", "MAR2_36", "MAR2_39", "MAR2_47", "MAR3_10", "MAR3_100", 
+            "MAR3_114", "MAR3_12", "MAR3_201", "MAR3_209", "MAR3_215", "MAR3_22", "MAR3_28")
+example_element <- "Zr"
+
+# Outlier-Erkennung für jedes Objekt mit allen Methoden
+outlier_results <- cbind(Messprotokoll, RFA.val_cal) |> 
+  filter(Object != "Standart-TS") |> 
+  filter(Object %in% example_objects) |> 
+  dplyr::select(Object, all_of(example_element)) |> 
+  tidyr::unnest(cols = all_of(example_element)) |> 
+  group_by(Object) |> 
+  summarise(
+    iqr = list(detect_outliers(get(example_element), "iqr")),
+    z = list(detect_outliers(get(example_element), "z")),
+    dixon = list(detect_outliers(get(example_element), "dixon")),
+                 mod_z = list(detect_outliers(get(example_element), "modified_z"))
+  ) |> 
+  tidyr::pivot_longer(cols = c(iqr, z, dixon, mod_z), names_to = "method", values_to = "outlier_data") |> 
+  tidyr::unnest(outlier_data)
+
+```
+
+
+```{r}
+ggplot(outlier_results, aes(x = Object, y = value, color = outlier)) +
+  geom_point(size = 1) +
+  facet_wrap(~ method) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(title = paste("Outlier-Erkennung für", example_element),
+       x = "Objekt",
+       y = paste("Messwert für", example_element),
+       color = "Outlier?") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+## quality mean
+### new
+```{r}
+RFA.sd_cl |> 
+pivot_longer(low.error.elements_15,names_to = "Element", values_to = "mean") |> group_by(Element) |>
+  summarise(mean = mean(mean, na.rm = TRUE)) |> 
+  arrange(-mean)
+
+
+
+low.sd.elements.cl_10 <- RFA.sd_cl |> 
+pivot_longer(low.error.elements_15,names_to = "Element", values_to = "mean") |> group_by(Element) |>
+  summarise(mean = mean(mean, na.rm = TRUE)) |> 
+  filter(mean < 10) |> 
+  pull(Element)
+
+low.sd.elements.cl_15 <- RFA.sd_cl |> 
+pivot_longer(low.error.elements_15,names_to = "Element", values_to = "mean") |>
+  group_by(Element) |>
+  summarise(mean = mean(mean, na.rm = TRUE)) |> 
+  filter(mean < 15) |> 
+  pull(Element)
+
+low.sd.elements.cl_20 <- RFA.sd_cl |> 
+pivot_longer(low.error.elements_15,names_to = "Element", values_to = "mean") |> group_by(Element) |>
+  summarise(mean = mean(mean, na.rm = TRUE)) |> 
+  filter(mean < 20) |> 
+  pull(Element)
+```
+
+```{r}
+# Ensure RFA.error_prop is in a tidy format (long format) for ggplot
+RFA.sd_long <- RFA.sd_cl %>%
+  dplyr::select(any_of(all_elements)) |> 
+  pivot_longer(cols = everything(), names_to = "Element", values_to = "Sd") %>%
+  filter(!is.na(Sd))  # Remove NA values
+
+# Create the boxplot
+ggplot(RFA.sd_long, aes(x = Element, y = Sd)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +  # Boxplot with custom fill color
+  labs(
+    x = "Element",  # x-axis label
+    y = "Relative Error (%)",  # y-axis label
+    title = "Distribution of Relative Errors by Element"  # Plot title
+  ) +
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for better readability
+
+# Ensure RFA.error_prop is in a tidy format (long format) for ggplot
+RFA.sd_long <- RFA.sd_cl %>%
+  dplyr::select(any_of(all_elements)) |> 
+  dplyr::select(-Cr) |> 
+  pivot_longer(cols = everything(), names_to = "Element", values_to = "Sd") %>%
+  filter(!is.na(Sd))  # Remove NA values
+
+# Create the boxplot
+ggplot(RFA.sd_long, aes(x = Element, y = Sd)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +  # Boxplot with custom fill color
+  labs(
+    x = "Element",  # x-axis label
+    y = "Relative Error (%)",  # y-axis label
+    title = "Distribution of Relative Errors by Element"  # Plot title
+  ) +
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for better readability
+```
+
+
+## modified z as clean data
+```{r}
+RFA.val_mean <- RFA.val_dix
+```
+
+
+
+#elements
+## main elements
+```{r}
+
+main_elements <- c("Si", "Al", "Ca", "K", "Fe", "Ti", "P", "Mn")
+
+
+
+RFA.ME <- RFA.val_mean |> 
+  dplyr::select(all_of(main_elements)) |> 
+ # select(-Mg) |> 
+  mutate(Si = Si*2.1392,
+         Al = Al*1.8895,
+         Ca = Ca*1.3992,
+         K = K*1.2046,
+         Fe = Fe*1.4297,
+      #   S = S*2.4972, #rausnehmen
+         Ti = Ti*1.6681,
+         P = 2.2916,
+       Mn = 1.5825
+         )
+
+
+  df_long <- RFA.ME %>%
+  rownames_to_column(var = "row_id") %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "value")
+
+# Berechnen Sie die Summe jeder Zeile und fügen Sie sie hinzu
+df_long <- df_long %>%
+  group_by(row_id) %>%
+  mutate(row_sum = sum(value)) %>%
+  ungroup()
+
+# Berechnen Sie die Prozente
+df_long <- df_long %>%
+  mutate(percent = (value / row_sum) * 100)
+
+# Konvertieren Sie zurück in das breite Format
+RFA.ME <- df_long %>%
+  dplyr::select(row_id, variable, percent) %>%
+  pivot_wider(names_from = "variable", values_from = "percent") %>%
+  column_to_rownames(var = "row_id")
+
+```
+
+
+## new data
+```{r}
+
+
+RFA.val <- RFA.val_mean
+
+
+ RFA.val <- RFA.val |> 
+  dplyr::select(any_of(all_elements))
+ 
+ 
+ all_elements <- RFA.val |> 
+    rename(Al2O3 = Al, Fe2O3 = Fe, MnO = Mn, SiO2 = Si) |> 
+  colnames()
+
+ RFA.val <- RFA.val |> 
+  dplyr::select(-all_of(main_elements)) |> 
+  cbind(RFA.ME) |> 
+  dplyr::select(any_of(colnames(Messprotokoll)),all_of(main_elements), everything())
+
+ 
+low.sd.elements.cl_10 <- RFA.val |> 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+    rename(Al2O3 = Al, Fe2O3 = Fe, MnO = Mn, SiO2 = Si) |> 
+  colnames()
+ 
+ RFA.val <- RFA.val |> 
+  rename(Al2O3 = Al, Fe2O3 = Fe, MnO = Mn, SiO2 = Si)
+
+```
+
+
+# Standardvalue
+```{r}
+RFA.std <- RFA.val |>  
+    dplyr::select(any_of(all_elements)) |> 
+mutate_all(~ (. - mean(.)) / sd(.)) 
+
+
+```
+
+
+# final RFA.val
+```{r}
+Messprotokoll_mean <- Messprotokoll |> 
+  group_by(Object) |> 
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+            across(where(is.character), first))
+
+
+
+RFA.val <- Messprotokoll_mean |> 
+  cbind(RFA.val) |> 
+  remove_rownames()
+
+RFA.std <- Messprotokoll_mean |> 
+  cbind(RFA.std) |> 
+  remove_rownames()
+```
+
+
+```{r}
+RFA.val |> 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ summarise(across(everything(), ~ (sd(.x, na.rm = TRUE) / mean(.x, na.rm = TRUE)) * 100))
+
+
+```
+
+
+
+
+
+
+# Marandet with attributes
+```{r}
+#dput(pottery2, file = "mar_pot_attr.R")
+pot_attr <- read.csv2(here("data/pottery_attr_mar.csv"))
+
+mar_attr <- RFA.val |> 
+  filter(Site == "Marandet") |> 
+  left_join(pot_attr, by = c("Object" = "RFAID" )) |> 
+  filter(!is.na(Slip))
+
+mar_attr <- RFA.std |> 
+  filter(Site == "Marandet") |> 
+  left_join(pot_attr, by = c("Object" = "RFAID" )) |> 
+  filter(!is.na(Slip))
+
+pot_attr
+```
+
+```{r}
+
+sgrf_mar <- c("MAR3_208", "MAR2_39", "MAR1_4", "MAR3_209", "MAR3_28")
+
+rfa_mar <- mar_attr |> 
+  unite(Rim, Collar, Lip) |> 
+ # dplyr::select(Object, all_elements, X:Angle.fc)|> 
+  mutate(
+    JAS_decor = case_when(
+        Object %in% sgrf_mar ~ "Sgraffito",
+      Object == "MAR_204" ~ "Wheel-thrown",
+      grepl("^Undecorated", JAS_decor) ~ "Undecorated",
+grepl("^Folded_strip_roulette", JAS_decor) ~ "Folded_strip_roulette",
+  #    grepl("^P", Decoration.technique.1) ~ "Paint",
+      grepl("^Mat", JAS_decor) ~ "Mat",
+      TRUE ~ "Other decor"
+    )
+  ) |> 
+  column_to_rownames("Object") 
+
+
+  
+```
+
+
+
+##decor and pca
+```{r}
+
+pca_mar <- rfa_mar |> 
+dplyr::select(Rb, Y, Th,Fe2O3,  Zr, Sr) |> 
+  #dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+  PCA()
+
+pca_mar_dec_ind_1_2 <- fviz_pca_ind(pca_mar,
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = rfa_mar$JAS_decor, # color by groups
+             #  shape = shapes,
+             pointshape = 16, 
+             palette = c("#E69F00", "#56B4E9", "#009E73", 
+                                                      "#F0E442", "black", "#CC79A7"),
+           #  addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups",
+            mean.point = FALSE
+             )
+
+
+pca_mar_dec_ind_1_3 <- fviz_pca_ind(pca_mar,
+             axes = c(1,3),
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = rfa_mar$JAS_decor, # color by groups
+             #  shape = shapes,
+             pointshape = 16, 
+             palette = c("#E69F00", "#56B4E9", "#009E73", 
+                                                      "#F0E442", "black", "#CC79A7"),
+           #  addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups",
+            mean.point = FALSE
+             )
+
+fviz_pca_ind(pca_mar,
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = mar_attr$Rim, # color by groups
+             #  shape = shapes,
+             pointshape = 16, 
+             palette = c("#E69F00", "#56B4E9", "#009E73", 
+                                                      "#F0E442", "black", "#CC79A7"),
+         #   addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups"
+             )
+
+fviz_pca_ind(pca_mar,
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = rfa_mar$Rim, # color by groups
+             #  shape = shapes,
+             pointshape = 16, 
+         #    palette = c("#E69F00", "#56B4E9", "#009E73", 
+                               #                       "#F0E442", "black", "#CC79A7"),
+         #   addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups"
+             )
+
+pca_mar_var_1_2 <- fviz_pca_var(pca_mar, col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+
+
+pca_mar_var_1_3 <- fviz_pca_var(pca_mar, axes = c(1,3), col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+
+
+
+```
+
+
+
+```{r}
+pca_mar_dec_ind_1_2
+
+pca_mar_dec_ind_1_3
+
+ggsave(here("results/plots/pca_mar_dec_ind_1_2.jpeg"), plot = pca_mar_dec_ind_1_2, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+ggsave(here("results/plots/pca_mar_dec_ind_1_3.jpeg"), plot = pca_mar_dec_ind_1_3, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+library(cowplot)
+
+pca_mar_var <- plot_grid(pca_mar_var_1_2, pca_mar_var_1_3, ncol = 2)
+
+pca_mar_var
+
+ggsave(here("results/plots/pca_mar_var.jpeg"), plot = pca_mar_var, device = "jpeg", dpi = 300, width = 8, height = 6)
+```
+
+
+
+# malhanobis function
+```{r}
+detect_mahalanobis_outliers <- function(data, pca = NULL, quantile_threshold = 0.5) {
+  # Falls eine PCA angegeben wurde, nutze deren Koordinaten als Datenbasis
+  if (!is.null(pca)) {
+    data <- pca$ind$coord  # Standardmäßig Hauptkomponenten-Koordinaten aus FactoMineR-PCA
+  }
+  
+  # Entferne Spalten ohne Varianz (damit die Kovarianzmatrix invertierbar bleibt)
+ # data <- data[, apply(data, 2, var) > 0, drop = FALSE]
+  data <- data$ind$coord
+  # Berechne Mahalanobis-Distanz
+  center <- colMeans(data, na.rm = TRUE)
+  cov_matrix <- cov(data, use = "complete.obs")  
+  mahal_dist <- mahalanobis(data, center, cov_matrix)
+  
+  # Setze den Chi-Quadrat-Schwellenwert
+  cutoff <- qchisq(quantile_threshold, df = ncol(data))
+  
+  # Identifiziere Outlier
+  outliers <- which(mahal_dist > cutoff)
+  
+  return(outliers)
+}
+
+mar_pca <- rfa_mar |> 
+  dplyr::select(Rb, Sr, Y, Zn, Th) |> 
+  PCA()
+
+outliers <- detect_mahalanobis_outliers(mar_pca)
+```
+
+# RFA.std as final version
+```{r}
+RFA.fin <- RFA.std
+```
+
+
+# removing outliers from regional groups
+## Chad
+### Lake_Chad_Northwest
+
+```{r}
+chad_nw1 <- RFA.fin |> 
+  filter(Region == "Lake_Chad_Northwest" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_nw_pca <- chad_nw1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+# dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+
+outliers <- detect_mahalanobis_outliers(chad_nw_pca) 
+outliers 
+length(outliers)
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_nw_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_nw1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_nw_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_nw1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_nw_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_nw_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_nw_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_nw_pca, 
+             axes = c(3,4)
+           )
+
+
+outliers_chad_nw <- outliers
+```
+
+### Lake_Chad_west
+
+
+```{r}
+chad_w1 <- RFA.fin |> 
+  filter(Region == "Lake_Chad_West" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_w_pca <- chad_w1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+#dplyr::select(any_of(low.error.elements_10)) |> 
+#  dplyr::select(-Sr,-Mn) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(chad_w_pca) 
+
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_w_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_w1) %in% outliers,
+            # addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_w_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_w1) %in% outliers,
+          #   addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_w_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_w_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_w_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_w_pca, 
+             axes = c(3,4)
+           )
+
+
+outliers_chad_w <- outliers
+```
+### Lake Chad East
+
+```{r}
+chad_e1 <- RFA.fin |> 
+  filter((Region == "Lake_Chad_East") | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  filter(!Object %in% c("KAM_4", "TIE_100", "TIE_101", "TIE_13", "TIE_15"))|> 
+    filter(!grepl("^TIE2", Object)) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_e_pca <- chad_e1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+# dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(chad_e_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_e_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_e1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_e_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_e1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_e_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_e_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_e_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_e_pca, 
+             axes = c(3,4)
+           )
+
+outliers_chad_e <- outliers
+
+```
+### Lake Chad South
+
+```{r}
+chad_s1 <- RFA.fin |> 
+  filter(Region == "Lake_Chad_South" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_s_pca <- chad_s1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+# dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(chad_s_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_s1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_s1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_s_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_s_pca, 
+             axes = c(3,4)
+           )
+
+outliers_chad_s <- outliers
+
+```
+### Lake Chad Southeast
+
+```{r}
+chad_se1 <- RFA.fin |> 
+  filter(Region == "Lake_Chad_Southeast" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_se_pca <- chad_se1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(chad_se_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_se_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_se1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_se_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_se1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_se_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_se_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_se_pca, 
+             axes = c(3,4)
+           )
+
+outliers_chad_se <- outliers
+
+```
+### Lake Chad Southwest
+
+```{r}
+chad_sw1 <- RFA.fin |> 
+  filter(Region == "Lake_Chad_Southwest" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+chad_sw_pca <- chad_sw1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(chad_sw_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_sw_pca, 
+             label = "none", 
+             habillage = 1:nrow(chad_sw1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_sw_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(chad_sw1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_sw_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_sw_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(chad_s_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_sw_pca, 
+             axes = c(3,4)
+           )
+
+outliers_chad_sw <- outliers
+
+```
+
+
+## Essouk
+
+```{r}
+ess1 <- RFA.fin |> 
+  filter(Region == "Essouk" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+  remove_rownames() |> 
+  filter(!(Object %in% c("ESS_23","ESS_24","ESS_25","ESS_26","ESS_27","ESS_28","ESS_29"))) |> 
+  column_to_rownames("Object")
+
+ess_pca <- ess1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(ess_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(ess_pca, 
+             label = "none", 
+             habillage = 1:nrow(ess1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(ess_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(ess1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(ess_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(ess_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(ess_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(chad_se_pca, 
+             axes = c(3,4)
+           )
+
+outliers_ess <- outliers
+
+```
+
+## Niger_Niamey
+```{r}
+nig_nia1 <- RFA.fin |> 
+  filter(Site == "Karey_Gorou" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |>
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+nig_nia_pca <- nig_nia1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(nig_nia_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(nig_nia_pca, 
+             label = "none", 
+             habillage = 1:nrow(nig_nia1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(nig_nia_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(nig_nia1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(nig_nia_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(nig_nia_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(nig_nia_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(nig_nia_pca, 
+             axes = c(3,4)
+           )
+
+outliers_nig_nia <- outliers
+
+```
+
+## Marandet
+```{r}
+untypical_types_mar <- c("MAR1_15", "MAR1_16", "MAR1_26", "MAR1_3", 
+            "MAR1_34", "MAR1_39", "MAR1_42", "MAR1_45", "MAR1_5", "MAR2_1", "MAR2_17", 
+            "MAR2_214", "MAR2_25", "MAR2_36", "MAR2_39", "MAR2_47", "MAR3_10", 
+            "MAR3_100", "MAR3_114", "MAR3_12", "MAR3_201", "MAR3_209", "MAR3_215", 
+            "MAR3_22", "MAR3_28", "MAR1_18", "MAR1_24", "MAR1_4", "MAR1_7", 
+            "MAR2_203", "MAR2_3", "MAR2_52", "MAR3_208", "MAR3_3", "MAR3_34", "MAR_204", "MAR3_84", "MAR2_0", "MAR_1001", "MAR_1002", "MAR_1003")
+
+mar1 <- RFA.fin |> 
+  filter(!(Object %in% c(untypical_types_mar))) |> 
+  filter(Region == "Marandet" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |> 
+    column_to_rownames("Object")
+
+mar_pca <- mar1 |> 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(mar_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(mar_pca, 
+             label = "none", 
+             habillage = 1:nrow(mar1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(mar_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(mar1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(mar_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(mar_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(mar_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(mar_pca, 
+             axes = c(3,4)
+           )
+
+outliers_mar <- outliers
+
+```
+## Zinder
+```{r}
+zin1 <- RFA.fin |> 
+  filter(Region == "Zinder" | Object %in% c("MAR3_54", "ESS_13", "KAG3_5", "TIE_70", "MDA_6")) |>
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+zin_pca <- zin1 |> 
+#  dplyr::select(Zn, Rb, Zr) 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+ #dplyr::select(any_of(low.error.elements_10)) |> 
+  PCA()
+
+
+outliers <- detect_mahalanobis_outliers(zin_pca) 
+outliers 
+```
+
+```{r}
+
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(zin_pca, 
+             label = "none", 
+             habillage = 1:nrow(zin1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(zin_pca, 
+             axes = c(3,4),
+             label = "none", 
+             habillage = 1:nrow(zin1) %in% outliers,
+             addEllipses = TRUE, 
+             palette = c("black", "red"))
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(zin_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(zin_pca, 
+             axes = c(1,2)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_ind(zin_pca, 
+             axes = c(3,4)
+           )
+
+# PCA mit Hervorhebung der Ausreißer
+fviz_pca_var(zin_pca, 
+             axes = c(3,4)
+           )
+
+outliers_zin <- outliers
+
+```
+
+# list of only reference groups
+```{r}
+outliers_all <- c(outliers_mar, outliers_chad_nw, outliers_chad_e, 
+                  outliers_chad_sw, outliers_chad_w, outliers_chad_se, 
+                  outliers_chad_s, outliers_nig_nia, outliers_ess, outliers_zin)
+
+outliers_all <- c(names(outliers_all), untypical_types_mar, "WAL_16")
+
+RFA.ref <- RFA.fin |> 
+  filter(!(Object %in% outliers_all)) |> 
+  filter(Site != "Birni_Lafyia")
+```
+
+# discriminatory ref
+
+```{r}
+
+RFA4 <- RFA.val |> 
+  filter((Object %in% RFA.ref$Object)) |> 
+  filter(Site != "Birni_Lafyia") |> 
+ # filter(Region = "Tilemsi-Valley") |> 
+  remove_rownames() |> 
+  column_to_rownames("Object")
+
+RFA3$Object[duplicated(RFA3$Object)]
+
+RFA.val$Object[duplicated(RFA.val$Object)]
+```
+
+```{r}
+all_dis <- RFA.ref |> 
+dplyr::select(Region,any_of(low.sd.elements.cl_10)) |> 
+  rename(Prov = Region)
+```
+
+```{r}
+set.seed(123)
+training.samples <- all_dis$Prov %>%
+  createDataPartition(p = 0.8, list = FALSE)
+
+
+train.data <- all_dis[training.samples, ]
+test.data <- all_dis[-training.samples, ]
+
+# Estimate preprocessing parameters
+preproc.param <- train.data %>% 
+  preProcess(method = c("center", "scale"))
+# Transform the data using the estimated parameters
+train.transformed <- preproc.param %>% predict(train.data)
+test.transformed <- preproc.param %>% predict(test.data)
+```
+
+
+```{r}
+library(MASS)
+# Fit the model
+model <- lda(Prov~., data = train.transformed)
+# Make predictions
+predictions <- model %>% predict(test.transformed)
+# Model accuracy
+mean(predictions$class==test.transformed$Prov)
+
+model
+
+#plot(model)
+
+means <- model$means
+
+
+dif <- means %>%
+  as.data.frame() |> 
+  summarise_all(~ sum(abs(. - lag(.)), na.rm = TRUE)) |> 
+   t() |> 
+    as.data.frame() |> 
+  arrange(-V1)
+
+# Print dataframe
+print(dif)
+
+class(means)
+
+all_dis |> 
+  rownames_to_column("ID") |> 
+  ggplot()+
+  geom_label(aes(x = Y, y = Rb, colour = Prov, label = ID))
+
+all_dis |> 
+  rownames_to_column("ID") |> 
+  ggplot()+
+  geom_label(aes(x = Zn, y = V, colour = Prov, label = ID))
+
+all_dis |> 
+  rownames_to_column("ID") |> 
+  ggplot()+
+  geom_label(aes(x = Fe2O3, y = Al2O3, colour = Prov, label = ID))
+
+mean(predictions$class==test.transformed$Prov)
+```
+##visualization
+
+```{r}
+library(gt)
+library(scales)
+
+means <- as.data.frame(model$mean)
+
+elements_mean <- colnames(means)
+# Färben mit Farbverlauf
+means %>%
+  rownames_to_column("Site") |> 
+  gt() %>%
+  data_color(
+    columns = elements_mean,  # Wendet es auf alle numerischen Spalten an
+    colors = scales::col_numeric(
+      palette = c("red", "yellow", "green"),
+      domain = range(as.matrix(means[elements_mean]), na.rm = TRUE)  # Wertebereich über alle Spalten hinweg
+    )
+    )
+  
+write.csv2(means, here("results/mean.csv"))
+
+
+as.data.frame(model$mean)
+```
+
+## reference groups mean & sd
+
+```{r}
+reference_groups <- RFA4 |> 
+ # filter(Local == "Local") |> 
+ # column_to_rownames("Object") |> 
+#  dplyr::select(Region, Mo:Mg) |> 
+  # dplyr::select(-Bal, -Mo, -U, -Se, -Hg, -W, -Sn, -Cd, -Ag, -Bi, -Re, -Ta, -Hf, -Mg) 
+dplyr::select(Region,any_of(low.sd.elements.cl_10)) |> 
+ # dplyr::select(Region, any_of(low.error.elements_10)) |> 
+  rename(Prov = Region)
+
+rg_sd <- reference_groups |> 
+  group_by(Prov) |> 
+ summarise(across(everything(), ~ (sd(.x, na.rm = TRUE) / mean(.x, na.rm = TRUE)) * 100))
+
+rg_mean <- reference_groups |> 
+  group_by(Prov) |> 
+ summarise(across(everything(), ~ (mean(.x, na.rm = TRUE))))
+
+rg_mean %>%
+  gt() %>%
+  # Wendet die Farbskala auf jede numerische Spalte einzeln an
+  { 
+    tbl <- .  
+    for (col in elements_mean) {
+      tbl <- tbl %>%
+        data_color(
+          columns = all_of(col),
+          colors = scales::col_numeric(
+            palette = c("red", "yellow", "green"),
+            domain = range(rg_mean[[col]], na.rm = TRUE)  # Nur Werte aus der jeweiligen Spalte
+          )
+        )
+    }
+    tbl
+  }
+  
+# Färben mit Farbverlauf
+rg_sd %>%
+  rownames_to_column("Site") |> 
+  gt() %>%
+  data_color(
+    columns = elements_mean,  # Wendet es auf alle numerischen Spalten an
+    colors = scales::col_numeric(
+      palette = c("green", "yellow","red" ),
+      domain = range(as.matrix(rg_sd[elements_mean]), na.rm = TRUE)  # Wertebereich über alle Spalten hinweg
+    )
+    )
+
+write.csv2(rg_mean, here("results/rg_means.csv"))
+write.csv2(rg_sd, here("results/rg_sd.csv"))
+
+```
+# reference groups pca
+```{r}
+
+sgrf_mar <- c("MAR3_208", "MAR2_39", "MAR1_4", "MAR3_209", "MAR3_28")
+
+loc <- RFA.ref |> 
+ filter(!(Object %in% outliers_all))|> 
+    filter(!grepl("^TIE2", Object)) |> 
+  column_to_rownames("Object")
+
+
+
+pca_loc <- loc |> 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |>   PCA()
+
+
+```
+
+```{r}
+
+# Farbenblind-freundliche "Okabe-Ito"-Palette
+cb_palette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                "#D55E00", "#CC79A7", "#999999", "#660066", "#FFB6C1")
+
+# Definiere verschiedene Symbole für Gruppen (bis zu 10 Gruppen)
+shape_symbols <- c(1, 17, 18, 15,  3, 7, 10, 13,8, 11)
+
+# Stelle sicher, dass loc$Region ein Faktor ist
+loc$Region <- as.factor(loc$Region)
+
+# Erstelle eine Zuordnung von Region -> Symbol
+#region_levels <- levels(loc$Region3)
+#symbol_mapping <- setNames(shape_symbols[seq_along(region_levels)], region_levels)
+
+# Visualisierung mit fviz_pca_ind
+pca_ref_ind_1_2 <-fviz_pca_ind(pca_loc,
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+          #   addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+            # ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+# Visualisierung mit fviz_pca_ind
+pca_ref_ind_1_3 <- fviz_pca_ind(pca_loc,
+                          axes = c(1,3),
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+            # addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+           #  ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+
+pca_ref_var_1_2 <- fviz_pca_var(pca_loc, col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+pca_ref_var_1_3 <- fviz_pca_var(pca_loc, col.var = "cos2",
+             axes = c(3,4),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+```
+
+
+```{r}
+pca_ref_ind_1_2
+
+pca_ref_ind_1_3
+
+ggsave(here("results/plots/pca_ref_ind_1_2.jpeg"), plot = pca_ref_ind_1_2, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+ggsave(here("results/plots/pca_ref_ind_1_3.jpeg"), plot = pca_ref_ind_1_3, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+pca_ref_var <- plot_grid(pca_ref_var_1_2, pca_ref_var_1_3, ncol = 2)
+
+pca_ref_var
+
+ggsave(here("results/plots/pca_ref_var.jpeg"), plot = pca_ref_var, device = "jpeg", dpi = 300, width = 8, height = 6)
+```
+
+
+# sgraffito
+## mar sgraffito and all reference groups
+```{r}
+
+sgrf_mar <- c("MAR3_208", "MAR2_39", "MAR1_4", "MAR3_209", "MAR3_28")
+
+loc <- RFA.fin |> 
+  filter(!(Object %in% outliers_all)|  Object %in% sgrf_mar)|> 
+  filter(Site != "Marandet" |  Object %in% sgrf_mar) |> 
+    filter(!grepl("^TIE2", Object)) |> 
+    mutate(Prov = ifelse(grepl("marandet", Region, ignore.case = TRUE), "Sgraffito", "local")) |> 
+  mutate(Region2 = case_when(
+    str_detect(Region, "Lake_Chad") ~ "Chad Basin",
+    Region == "Marandet" ~ "sgraffito_marandet",
+    TRUE ~ Region  # Behalte alle anderen Werte unverändert
+  )) |> 
+  mutate(Region3 = case_when(
+    str_detect(Region, "Lake_Chad") ~  Region,
+    Region == "Marandet" ~ "sgraffito_marandet",
+    TRUE ~ "other"  # Alle anderen Werte werden zu "other"
+  )) |> 
+  column_to_rownames("Object")
+
+
+pca_loc <- loc |> 
+  dplyr::select(any_of(low.sd.elements.cl_10)) |> 
+   # dplyr::select(-Si,-Al,-Sr,-V) |> 
+  PCA()
+
+
+pca_loc$var$contrib[,1:5]
+```
+
+```{r}
+
+fviz_pca_ind(pca_loc,
+                          axes = c(1,2),
+
+           geom.ind = "point", # show points only (nbut not "text")
+             col.ind = loc$Region, # color by groups
+             #  shape = shapes,
+             pointshape = 20, 
+            # palette = "viridis",
+              cb_palette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                "#D55E00", "#CC79A7", "#999999", "#660066", "#FFB6C1"),
+           addEllipses = TRUE,             # Ellipsen hinzufügen
+             ellipse.type = "t",             # Verwendung der t-Verteilung für Ellipsen
+             ellipse.level = 0.75,           # Konfidenzniveau; ein niedrigerer Wert = engere Ellipse
+             legend.title = "Groups"
+             ) 
+
+fviz_pca_ind(pca_loc,
+             axes = c(1,3),
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = loc$Region, # color by groups
+             #  shape = shapes,
+             pointshape = 20, 
+            # palette = "viridis",
+              cb_palette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                "#D55E00", "#CC79A7", "#999999", "#660066", "#FFB6C1"),
+           addEllipses = TRUE,             # Ellipsen hinzufügen
+             ellipse.type = "t",             # Verwendung der t-Verteilung für Ellipsen
+             ellipse.level = 0.75,           # Konfidenzniveau; ein niedrigerer Wert = engere Ellipse
+             legend.title = "Groups"
+             
+             ) 
+
+fviz_pca_var(pca_loc, col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+fviz_pca_var(pca_loc, col.var = "cos2",
+             axes = c(1,3),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+```
+## Region2
+```{r}
+library(factoextra)
+library(ggplot2)
+
+# Farbenblind-freundliche "Okabe-Ito"-Palette
+cb_palette <- c("#56B4E9", "#009E73", "#F0E442", "#999999","#0072B2", 
+                "#D55E00", "#CC79A7",  "#660066", "#FFB6C1")
+
+# Definiere verschiedene Symbole für Gruppen (bis zu 10 Gruppen)
+shape_symbols <- c(17, 18, 15, 8, 3, 7, 10, 13, 11)
+
+# Stelle sicher, dass loc$Region ein Faktor ist
+loc$Region2 <- as.factor(loc$Region2)
+
+# Erstelle eine Zuordnung von Region -> Symbol
+#region_levels <- levels(loc$Region2)
+#symbol_mapping <- setNames(shape_symbols[seq_along(region_levels)], region_levels)
+
+# Visualisierung mit fviz_pca_ind
+pca_sgrf_ref_ind_1_2_g <- fviz_pca_ind(pca_loc,
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region2,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+           #  addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+          #   ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+# Visualisierung mit fviz_pca_ind
+pca_sgrf_ref_ind_1_3_g <- fviz_pca_ind(pca_loc,
+                          axes = c(1,3),
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region2,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+            # addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+           #  ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+pca_sgrf_ref_1_2 <- fviz_pca_var(pca_loc, col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+pca_sgrf_ref_1_3 <- fviz_pca_var(pca_loc, col.var = "cos2",
+             axes = c(1,3),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+
+```
+
+
+```{r}
+pca_sgrf_ref_ind_1_2_g
+
+pca_sgrf_ref_ind_1_3_g
+
+ggsave(here("results/plots/pca_sgrf_ref_ind_1_2_g.jpeg"), plot = pca_sgrf_ref_ind_1_2_g, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+ggsave(here("results/plots/pca_sgrf_ref_ind_1_3_g.jpeg"), plot = pca_sgrf_ref_ind_1_3_g, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+library(cowplot)
+
+pca_sgrf_ref_var <- plot_grid(pca_sgrf_ref_1_2, pca_sgrf_ref_1_2, ncol = 2)
+
+pca_sgrf_ref_var
+
+ggsave(here("results/plots/pca_sgrf_ref_var.jpeg"), plot = pca_sgrf_ref_var, device = "jpeg", dpi = 300, width = 8, height = 6)
+```
+
+## Region 3
+```{r}
+library(factoextra)
+library(ggplot2)
+
+# Farbenblind-freundliche "Okabe-Ito"-Palette
+cb_palette <- c("#E69F00", "#009E73", "#F0E442", "#0072B2", 
+                "#D55E00", "#CC79A7", "#660066", "#999999", "#FFB6C1")
+
+# Definiere verschiedene Symbole für Gruppen (bis zu 10 Gruppen)
+shape_symbols <- c(17, 18, 15,  3, 7, 10, 13,8, 11)
+
+# Stelle sicher, dass loc$Region ein Faktor ist
+loc$Region3 <- as.factor(loc$Region3)
+
+# Erstelle eine Zuordnung von Region -> Symbol
+#region_levels <- levels(loc$Region3)
+#symbol_mapping <- setNames(shape_symbols[seq_along(region_levels)], region_levels)
+
+# Visualisierung mit fviz_pca_ind
+pca_sgrf_ref_ind_1_2_c <-fviz_pca_ind(pca_loc,
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region3,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+          #   addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+            # ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+# Visualisierung mit fviz_pca_ind
+pca_sgrf_ref_ind_1_3_c <- fviz_pca_ind(pca_loc,
+                          axes = c(1,3),
+             geom.ind = "point",        # Nur Punkte anzeigen
+             col.ind = loc$Region3,      # Farben nach Region
+             palette = cb_palette,      # Farbenblind-freundliche Farben
+          #   pointshape = unname(symbol_mapping[loc$Region]),  # Unterschiedliche Symbole je nach Gruppe
+            # addEllipses = TRUE,        # Ellipsen hinzufügen
+           #  ellipse.type = "t",        # t-Verteilung für Ellipsen
+           #  ellipse.level = 0.75,      # Konfidenzniveau (0.75 = engere Ellipse)
+             legend.title = "Groups"
+)
+
+fviz_pca_var(pca_loc, col.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+fviz_pca_var(pca_loc, col.var = "cos2",
+             axes = c(1,3),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+
+```
+```{r}
+pca_sgrf_ref_ind_1_2_c
+
+pca_sgrf_ref_ind_1_3_c
+
+ggsave(here("results/plots/pca_sgrf_ref_ind_1_2_c.jpeg"), plot = pca_sgrf_ref_ind_1_2_c, device = "jpeg", dpi = 300, width = 8, height = 6)
+
+ggsave(here("results/plots/pca_sgrf_ref_ind_1_3_c.jpeg"), plot = pca_sgrf_ref_ind_1_3_c, device = "jpeg", dpi = 300, width = 8, height = 6)
+```
+
+# plotly
+
+```{r}
+plot_3d_pca <- function(data, pca_res, color_by = "Region", shape_by = "Local", 
+                        custom_colors = NULL, show_arrows = TRUE) {
+  
+  library(plotly)
+  library(FactoMineR)
+  library(factoextra)
+  library(dplyr)
+  
+  # Prüfe, ob PCA schon durchgeführt wurde, wenn nicht, dann führe sie durch
+  if (missing(pca_res)) {
+    pca_res <- PCA(data, graph = FALSE)
+  }
+
+  # Extrahiere Eigenwerte
+  eig_values <- get_eigenvalue(pca_res)
+
+  # PCA Koordinaten in einen DataFrame umwandeln und die Variablen hinzufügen
+  pca_data <- as.data.frame(pca_res$ind$coord)
+  pca_data[[color_by]] <- data[[color_by]]
+
+  # Falls shape_by = FALSE, wähle eine Standardform für alle
+  if (is.logical(shape_by) && shape_by == FALSE) {
+    shape_column <- rep("circle", nrow(pca_data))
+  } else {
+    pca_data[[shape_by]] <- as.factor(data[[shape_by]])  # Sicherstellen, dass es ein Faktor ist
+    shape_column <- pca_data[[shape_by]]
+  }
+
+  # Extrahiere die Loadings (Pfeile für den Einfluss der Variablen)
+  loadings <- as.data.frame(pca_res$var$coord[, 1:3])
+  loadings$length <- sqrt(rowSums(loadings^2))
+  
+  # Wenn custom_colors nicht angegeben wird, wähle einen Standard-Farbverlauf
+  if (is.null(custom_colors)) {
+    custom_colors <- c("#FFA500", "brown", "#00008B", "#00FFFF", "#6495ED", 
+                       "#4682B4", "#ADD8E6", "#1E90FF", "#D2B48C")
+  }
+  
+  # Definiere bis zu 10 verschiedene Symbole
+  shape_symbols <- c("circle", "square", "diamond", "cross", "x", "triangle-up",
+                     "triangle-down", "triangle-left", "triangle-right", "pentagon")
+
+  # Falls es mehr als 10 Gruppen gibt, wiederhole die Symbole
+  if (!is.logical(shape_by) || shape_by != FALSE) {
+    unique_shapes <- length(unique(pca_data[[shape_by]]))
+    if (unique_shapes > length(shape_symbols)) {
+      shape_symbols <- rep(shape_symbols, length.out = unique_shapes)
+    }
+    shape_mapping <- setNames(shape_symbols[1:unique_shapes], unique(pca_data[[shape_by]]))
+  } else {
+    shape_mapping <- setNames(rep("circle", length(shape_column)), shape_column)
+  }
+
+  # Erstelle den 3D-Scatterplot mit den PCA-Individuen
+  fig <- plot_ly(data = pca_data) %>%
+    add_markers(x = ~Dim.1, 
+                y = ~Dim.2, 
+                z = ~Dim.3, 
+                color = ~get(color_by), 
+                symbol = shape_column, 
+                colors = custom_colors,
+                symbols = shape_mapping) %>%
+    layout(scene = list(xaxis = list(title = paste('Dim.1 (', round(eig_values[1, 2], 2), '%)', sep = '')),
+                        yaxis = list(title = paste('Dim.2 (', round(eig_values[2, 2], 2), '%)', sep = '')),
+                        zaxis = list(title = paste('Dim.3 (', round(eig_values[3, 2], 2), '%)', sep = ''))),
+           title = "3D PCA Plot")
+  
+  # Füge die Loadings-Pfeile hinzu, falls show_arrows = TRUE
+  if (show_arrows) {
+    colors <- colorRampPalette(c("blue", "red"))(nrow(loadings)) # Erstelle einen Farbverlauf
+    for (i in 1:nrow(loadings)) {
+      fig <- fig %>% 
+        add_trace(type = 'scatter3d', mode = 'lines',
+                  x = c(0, loadings[i, 1]),
+                  y = c(0, loadings[i, 2]),
+                  z = c(0, loadings[i, 3]),
+                  line = list(width = loadings$length[i] * 5, color = colors[i]), # Farbe und Breite je nach Einfluss
+                  name = rownames(loadings)[i], # Name für die Legende
+                  showlegend = TRUE) %>%
+        add_text(x = loadings[i, 1], 
+                 y = loadings[i, 2], 
+                 z = loadings[i, 3], 
+                 text = rownames(loadings)[i], 
+                 textposition = 'top middle',
+                 showlegend = FALSE)
+    }
+  }
+
+  # Zeige den Plot
+  return(fig)
+}
+
+
+plot_3d_pca(loc, pca_loc, shape_by = FALSE, custom_colors =  c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                "#D55E00", "#CC79A7", "#999999", "#660066", "#FFB6C1"))
+
+low.sd.elements.cl_10
+```
+```{r}
+RFA.fin |> 
+  group_by(Site, Region) |> 
+  summarise(n = n_distinct(Object))
+
+RFA.ref |> 
+    group_by(Site, Region) |> 
+  summarise(n = n_distinct(Object))
+```
+
+
+# Pottery attributes
+## decor abundance
+```{r}
+pot_attr |> 
+
+  ggplot(aes(x = JAS_decor, fill = JAS_decor)) +
+  geom_bar() +  # Erstellt ein normales Balkendiagramm
+  ggtitle("Main decoration technique documented sherds (n=217)") +
+    scale_fill_viridis_d(option = "veridis") +  # Farbenblindenfreundliche Farben
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "JAS Decor", y = "Anzahl", fill = "JAS Decor")
+```
+
