@@ -391,8 +391,16 @@ remove_outliers_and_calculate_stat <- function(values, threshold = 1.5, method =
     mean_non_outliers <- mean(non_outliers, na.rm = TRUE)
     sd_non_outliers <- sd(non_outliers, na.rm = TRUE)
 
-    # Ensure no division by
-
+    # Ensure no division by zero occurs
+    if (mean_non_outliers == 0) {
+      return(0)
+    } else {
+      return(sd_non_outliers / mean_non_outliers * 100)
+    }
+  } else {
+    return(mean(non_outliers, na.rm = TRUE))
+  }
+}
 
 ```
 
@@ -441,8 +449,42 @@ RFA.val_z <- protocol |>
     across(where(is.character), first)  
   )
 
-# Compute the mean for numeric columns and keep the first value for 
+```
 
+
+```{r}
+# Compute standard deviation percentage using IQR-based outlier removal
+RFA.sd_cl <- protocol |>  
+  cbind(RFA.val_cal) |>  
+  filter(Object != "Standart-TS") |>  
+  group_by(Object) |>  
+  dplyr::select(-Nr) |>  
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "iqr", calc_sd = TRUE)),  
+    across(where(is.character), first)  
+  )
+
+# Compute standard deviation percentage using Modified Z-score method  
+RFA.sd_cl <- protocol |>  
+  cbind(RFA.val_cal) |>  
+  filter(Object != "Standart-TS") |>  
+  group_by(Object) |>  
+  dplyr::select(-Nr) |>  
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "modified_z", calc_sd = TRUE)),  
+    across(where(is.character), first)  
+  )
+
+# Compute standard deviation percentage using Dixon’s Q-test method  
+RFA.sd_cl <- protocol |>  
+  cbind(RFA.val_cal) |>  
+  filter(Object != "Standart-TS") |>  
+  group_by(Object) |>  
+  dplyr::select(-Nr) |>  
+  summarise(
+    across(where(is.numeric), ~remove_outliers_and_calculate_stat(.x, method = "dixon", calc_sd = TRUE)),  
+    across(where(is.character), first)  
+  )
 ```
 
 
@@ -1306,8 +1348,12 @@ ess1 <- RFA.fin |>
 
 # Perform PCA on the selected elements from the filtered data
 ess_pca <- ess1 |> 
-  dplyr::select(any_of(low.sd.elements.cl_10)) |>  # Select the elements defined in 'low.sd.elements
+  dplyr::select(any_of(low.sd.elements.cl_10)) |>  # Select the elements defined in low.sd.elements
+PCA()
 
+# Detect Mahalanobis outliers based on the PCA result
+outliers <- detect_mahalanobis_outliers(ess_pca)  # Call the function to detect outliers
+outliers  # Output the indices of the outliers
 ```
 
 ```{r}
@@ -1554,12 +1600,6 @@ RFA4 <- RFA.val |>
   filter((Object %in% RFA.ref$Object)) |>  # Keep only the objects present in RFA.ref
   remove_rownames() |>  # Remove row names (if any) in the dataset
   column_to_rownames("Object")  # Set "Object" column as row names for the dataset
-
-# Check for duplicated 'Object' values in RFA3 dataset and list them
-RFA3$Object[duplicated(RFA3$Object)]  # This will return duplicated 'Object' values from RFA3
-
-# Check for duplicated 'Object' values in RFA.val dataset and list them
-RFA.val$Object[duplicated(RFA.val$Object)]  # This will return duplicated 'Object' values from RFA.val
 
 ```
 
